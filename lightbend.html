@@ -70,12 +70,24 @@
     cursor: pointer;
   }
   button:disabled { opacity: 0.4; cursor: default; }
+  #levels {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    margin-top: 18px;
+    max-width: 460px;
+  }
+  .level-btn { min-width: 64px; padding: 6px 8px; font-size: 16px; }
+  .level-btn.current { border-color: #f5d76e; }
+  .level-btn small { display: block; color: #f5d76e; font-size: 12px; }
 </style>
 </head>
 <body>
 <h1>LIGHTBEND</h1>
 <div id="info"></div>
 <div id="board"></div>
+<div id="levels"></div>
 <div id="buttons">
   <button id="undo" disabled>Undo</button>
   <button id="reset">Reset</button>
@@ -157,6 +169,7 @@
   let solved = false;
   let cellEls = [];   // the HTML element for each cell, in order
   let history = [];   // copies of the grid before each move, so Undo can go back
+  let progress = { unlocked: 0, stars: [] };   // best stars per level, and how many levels are open
 
   function key(x, y) { return x + ',' + y; }
 
@@ -223,12 +236,32 @@
     }
     nextBtn.disabled = !solved;
     undoBtn.disabled = history.length === 0;
+    renderLevels();
     if (solved) {
       const stars = starsFor(moves);
+      if (stars > progress.stars[level]) progress.stars[level] = stars;
+      progress.unlocked = Math.max(progress.unlocked, Math.min(level + 1, LEVELS.length - 1));
+      saveProgress();
       infoEl.textContent = '★'.repeat(stars) + '☆'.repeat(3 - stars) + '  Solved in ' + moves + ' moves (fewest possible: ' + PAR[level] + ')';
     } else {
       infoEl.textContent = 'Moves: ' + moves + '. Click a mirror to turn it and guide the light to the harbor.';
     }
+  }
+
+  // One button per level. Levels you haven't reached yet are locked.
+  function renderLevels() {
+    const box = document.getElementById('levels');
+    box.innerHTML = '';
+    LEVELS.forEach(function (_, i) {
+      const btn = document.createElement('button');
+      const locked = i > progress.unlocked;
+      const stars = progress.stars[i];
+      btn.className = 'level-btn' + (i === level ? ' current' : '');
+      btn.disabled = locked;
+      btn.innerHTML = (i + 1) + '<small>' + (locked ? '🔒' : '★'.repeat(stars) + '☆'.repeat(3 - stars)) + '</small>';
+      btn.addEventListener('click', function () { loadLevel(i); });
+      box.appendChild(btn);
+    });
   }
 
   function loadLevel(n) {
@@ -302,7 +335,32 @@
     return 0;
   }
 
-  loadLevel(savedLevel());
+  // ---------- Progress: best stars and unlocked levels ----------
+  // Saved in the browser. If saving is blocked, the game still works, it just forgets progress on reload.
+  const PROGRESS_KEY = 'lightbend-progress';
+
+  function loadProgress() {
+    const fresh = { unlocked: 0, stars: LEVELS.map(function () { return 0; }) };
+    try {
+      const saved = JSON.parse(localStorage.getItem(PROGRESS_KEY));
+      if (saved && Number.isInteger(saved.unlocked)) {
+        fresh.unlocked = Math.min(saved.unlocked, LEVELS.length - 1);
+      }
+      if (saved && Array.isArray(saved.stars)) {
+        for (let i = 0; i < LEVELS.length; i++) fresh.stars[i] = Number(saved.stars[i]) || 0;
+      }
+    } catch (e) { /* saving is optional */ }
+    return fresh;
+  }
+
+  function saveProgress() {
+    try { localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress)); } catch (e) { /* saving is optional */ }
+  }
+
+  progress = loadProgress();
+  const start = savedLevel();
+  progress.unlocked = Math.max(progress.unlocked, start);
+  loadLevel(start);
 })();
 </script>
 </body>
