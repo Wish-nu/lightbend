@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lamplight</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #040a12;
+    font-family: Georgia, "Times New Roman", serif;
+  }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    cursor: crosshair;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+(function () {
+  // ---------- Tuning numbers: change these to make the game easier or harder ----------
+  const OIL_MAX = 100;
+  const OIL_DRAIN = 2.5;          // oil used per second by a normal beam
+  const OIL_BOOST_EXTRA = 4;      // extra oil used per second while the mouse button is held
+  const OIL_CAN_AMOUNT = 25;      // oil gained from one oil can
+  const WRECK_LIMIT = 3;          // ships lost to the rocks before the game ends
+  const HARBOR_X = 60;            // ships that reach this x position are safe
+  const BEAM_RANGE = 330;         // how far the beam reaches normally
+  const BEAM_RANGE_BOOST = 480;   // how far it reaches while boosted
+  const BEAM_HALF = 0.16;         // half-width of the beam in radians (normal)
+  const BEAM_HALF_BOOST = 0.3;    // half-width of the beam in radians (boosted)
+  const GHOST_CHANCE = 0.33;      // chance a ship is a ghost ship (night 2 and later)
+  const GHOST_HIDDEN_ALPHA = 0.07; // how visible a ghost ship is in the dark (0 = invisible, 1 = normal)
+
+  // ---------- Setup ----------
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+
+  let W = 0, H = 0;
+  let mouseX = 0, mouseY = 0;
+  let mouseDown = false;
+  let boosting = false;
+  let beamAngle = Math.PI;
+  let time = 0;
+  let flash = 0;
+
+  let rocks = [];
+  let ships = [];
+  let cans = [];
+  let rain = [];
+
+  let game = null;          // holds the current run's data (null on the title screen)
+  let mode = 'title';       // 'title' | 'playing' | 'over'
+  let overReason = '';
+  let overAt = 0;
+  let bannerText = '';
+  let bannerTime = 0;
+
+  // The lighthouse sits on the right side of the screen.
+  function baseX() { return W * 0.8; }
+  function baseY() { return H * 0.5; }
+  function lampX() { return W * 0.8; }
+  function lampY() { return H * 0.5 - 34; }
+
+  // ---------- Helpers ----------
+  function newDrop(atTop) {
+    return {
+      x: Math.random() * W,
+      y: atTop ? -10 : Math.random() * H,
+      len: 8 + Math.random() * 12,
+      speed: 500 + Math.random() * 300
+    };
+  }
+
+  function resize() {
+    W = canvas.width = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+    if (mouseX === 0 && mouseY === 0) {
+      mouseX = W * 0.4;
+      mouseY = H * 0.5;
+    }
+    rain = [];
+    for (let i = 0; i < 140; i++) rain.push(newDrop(false));
+  }
+
+  function makeRocks(night) {
+    rocks = [];
+    const count = 8 + night * 2;
+    for (let i = 0; i < count; i++) {
+      rocks.push({
+        fx: 0.12 + Math.random() * 0.5,   // fraction of the screen width
+        fy: 0.08 + Math.random() * 0.84,  // fraction of the screen height
+        r: 16 + Math.random() * 28
+      });
+    }
+  }
+
+  function showBanner(text, seconds) {
+    bannerText = text;
+    bannerTime = seconds;
+  }
+
+  // Is this point inside the beam (within range and within the cone)?
+  function inBeam(x, y) {
+    const range = boosting ? BEAM_RANGE_BOOST : BEAM_RANGE;
+    const half = boosting ? BEAM_HALF_BOOST : BEAM_HALF;
+    const dx = x - lampX();
+    const dy = y - lampY();
+    if (Math.hypot(dx, dy) > range) return false;
+    let diff = Math.atan2(dy, dx) - beamAngle;
+    diff = Math.atan2(Math.sin(diff), Math.cos(diff)); // wrap to -PI..PI
+    return Math.abs(diff) <= half;
+  }
+
+  // Did the ship hit the lighthouse cliff or a rock?
+  function hitsLand(s) {
+    if (Math.hypot(s.x - baseX(), s.y - baseY()) < 40) return true;
+    for (const r of rocks) {
+      if (Math.hypot(s.x - r.fx * W, s.y - r.fy * H) < r.r + 6) return true;
+    }
+    return false;
+  }
+
+  // ---------- Spawning ----------
+  function spawnShip() {
+    ships.push({
+      x: W + 40,
+      y: H * (0.12 + Math.random() * 0.76),
+      vx: -30,
+      vy: 0,
+      lit: false,
+      // From night 2 on, about 1 ship in 3 is a ghost ship (nearly invisible unless lit).
+      ghost: game.night >= 2 && Math.random() < GHOST_CHANCE,
+      t: 0,
+      phase: Math.random() * Math.PI * 2
+    });
+  }
+
+  function spawnCan() {
+    cans.push({
+      x: W + 20,
+      y: H * (0.15 + Math.random() * 0.7),
+      t: Math.random() * 10
+    });
+  }
+
+  // ---------- Night and game flow ----------
+  function startNight(n) {
+    game.night = n;
+    game.nightTime = 0;
+    game.nightDuration = 45 + n * 5;
+    game.shipsToSpawn = 4 + n * 2;
+    game.spawnInterval = (game.nightDuration * 0.8) / game.shipsToSpawn;
+    game.spawnTimer = 1.5;
+    game.canTimer = 3;
+    game.dawn = false;
+    makeRocks(n);
+    showBanner('Night ' + n, 2.5);
+  }
+
+  function newGame() {
+    game = {
+      night: 1,
+      completed: 0,
+      saved: 0,
+      wrecked: 0,
+      oil: OIL_MAX,
+      dawn: false,
+      dawnTimer: 0
+    };
+    ships = [];
+    cans = [];
+    mode = 'playing';
+    startNight(1);
+  }
+
+  function startDawn() {
+    game.dawn = true;
+    game.dawnTimer = 3.5;
+    game.completed += 1;
+    game.oil = Math.min(OIL_MAX, game.oil + 40);
+    showBanner('Dawn breaks. Night ' + game.night + ' survived!', 3.5);
+  }
+
+  function endGame(reason) {
+    mode = 'over';
+    overReason = reason;
+    overAt = time;
+    boosting = false;
+  }
+
+  // ---------- Updating ----------
+  function moveShip(s, dt) {
+    s.t += dt;
+    if (s.lit) {
+      // Lit ships steer toward the cursor, so you lead them with the light.
+      const dx = mouseX - s.x;
+      const dy = mouseY - s.y;
+      const d = Math.hypot(dx, dy);
+      const speed = 75 + game.night * 3;
+      if (d > 5) {
+        const tvx = (dx / d) * speed;
+        const tvy = (dy / d) * speed;
+        const k = Math.min(1, 4 * dt);
+        s.vx += (tvx - s.vx) * k;
+        s.vy += (tvy - s.vy) * k;
+      }
+    } else {
+      // Unlit ships drift left and wobble up and down.
+      const k = Math.min(1, 1.5 * dt);
+      s.vx += (-30 - s.vx) * k;
+      s.vy += (Math.sin(s.t * 1.3 + s.phase) * 25 - s.vy) * k;
+    }
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    if (s.y < 15) { s.y = 15; s.vy = Math.abs(s.vy); }
+    if (s.y > H - 15) { s.y = H - 15; s.vy = -Math.abs(s.vy); }
+  }
+
+  function updateCans(dt) {
+    for (let i = cans.length - 1; i >= 0; i--) {
+      const c = cans[i];
+      c.t += dt;
+      c.x -= 35 * dt;
+      c.y += Math.sin(c.t * 2) * 12 * dt;
+      if (inBeam(c.x, c.y)) {
+        game.oil = Math.min(OIL_MAX, game.oil + OIL_CAN_AMOUNT);
+        cans.splice(i, 1);
+        showBanner('Oil +' + OIL_CAN_AMOUNT, 1);
+      } else if (c.x < -20) {
+        cans.splice(i, 1);
+      }
+    }
+  }
+
+  function updateAtmosphere(dt) {
+    if (Math.random() < dt * 0.25) flash = 1;      // occasional lightning
+    flash = Math.max(0, flash - dt * 2.5);
+    for (const d of rain) {
+      d.y += d.speed * dt;
+      d.x -= d.speed * 0.2 * dt;
+      if (d.y > H || d.x < -20) Object.assign(d, newDrop(true));
+    }
+  }
+
+  function update(dt) {
+    time += dt;
+    if (bannerTime > 0) bannerTime -= dt;
+    updateAtmosphere(dt);
+    beamAngle = Math.atan2(mouseY - lampY(), mouseX - lampX());
+
+    if (mode !== 'playing') return;
+
+    const g = game;
+
+    // Oil: the lamp always burns, and burns faster when boosted.
+    boosting = mouseDown && g.oil > 0;
+    g.oil -= (OIL_DRAIN + (boosting ? OIL_BOOST_EXTRA : 0)) * dt;
+    if (g.oil <= 0) {
+      g.oil = 0;
+      endGame('The lamp ran out of oil.');
+      return;
+    }
+
+    // Night timing, spawning, and dawn.
+    if (g.dawn) {
+      g.dawnTimer -= dt;
+      if (g.dawnTimer <= 0 && ships.length === 0) startNight(g.night + 1);
+    } else {
+      g.nightTime += dt;
+      if (g.shipsToSpawn > 0 && g.nightTime < g.nightDuration) {
+        g.spawnTimer -= dt;
+        if (g.spawnTimer <= 0) {
+          spawnShip();
+          g.shipsToSpawn -= 1;
+          g.spawnTimer = g.spawnInterval;
+        }
+      }
+      g.canTimer -= dt;
+      if (g.canTimer <= 0) {
+        spawnCan();
+        g.canTimer = 6 + Math.random() * 4;
+      }
+      if (g.nightTime >= g.nightDuration && ships.length === 0) startDawn();
+    }
+
+    // Ships: check light, move, then check harbor and rocks.
+    for (const s of ships) s.lit = inBeam(s.x, s.y);
+    for (const s of ships) moveShip(s, dt);
+
+    for (let i = ships.length - 1; i >= 0; i--) {
+      const s = ships[i];
+      if (s.x < HARBOR_X) {
+        ships.splice(i, 1);
+        g.saved += 1;
+        showBanner('A ship reached the harbor!', 1.5);
+      } else if (hitsLand(s)) {
+        ships.splice(i, 1);
+        g.wrecked += 1;
+        flash = 0.6;
+        showBanner('A ship hit the rocks! (' + g.wrecked + '/' + WRECK_LIMIT + ')', 2);
+        if (g.wrecked >= WRECK_LIMIT) {
+          endGame('Three ships were lost to the rocks.');
+          return;
+        }
+      }
+    }
+
+    updateCans(dt);
+  }
+
+  // ---------- Drawing ----------
+  function drawBackground() {
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, '#0b1a2c');
+    grad.addColorStop(1, '#040a12');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // Faint wave lines
+    ctx.lineWidth = 1;
+    for (let k = 0; k < 6; k++) {
+      ctx.strokeStyle = 'rgba(120, 170, 210, 0.07)';
+      ctx.beginPath();
+      for (let x = 0; x <= W; x += 16) {
+        const y = H * (0.15 + k * 0.14) + Math.sin(x * 0.012 + time * 0.8 + k * 1.7) * 7;
+        if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    // Shore and harbor on the left
+    ctx.fillStyle = '#2a2519';
+    ctx.fillRect(0, 0, HARBOR_X, H);
+    const glow = ctx.createRadialGradient(0, H * 0.5, 0, 0, H * 0.5, 140);
+    glow.addColorStop(0, 'rgba(255, 200, 110, 0.35)');
+    glow.addColorStop(1, 'rgba(255, 200, 110, 0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, 160, H);
+    ctx.fillStyle = 'rgba(255, 220, 160, 0.6)';
+    ctx.font = '12px Georgia, serif';
+    ctx.fillText('HARBOR', 6, H * 0.5 + 28);
+  }
+
+  function drawRocks() {
+    for (const r of rocks) {
+      const x = r.fx * W;
+      const y = r.fy * H;
+      ctx.fillStyle = '#1a2330';
+      ctx.beginPath();
+      ctx.arc(x, y, r.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#2c3a4b';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+
+  function drawBeam() {
+    const range = boosting ? BEAM_RANGE_BOOST : BEAM_RANGE;
+    const half = boosting ? BEAM_HALF_BOOST : BEAM_HALF;
+    const bg = ctx.createRadialGradient(lampX(), lampY(), 0, lampX(), lampY(), range);
+    bg.addColorStop(0, 'rgba(255, 240, 190, ' + (boosting ? 0.5 : 0.35) + ')');
+    bg.addColorStop(1, 'rgba(255, 240, 190, 0)');
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.moveTo(lampX(), lampY());
+    ctx.arc(lampX(), lampY(), range, beamAngle - half, beamAngle + half);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawLighthouse() {
+    // Cliff
+    ctx.fillStyle = '#222c38';
+    ctx.beginPath();
+    ctx.arc(baseX(), baseY(), 38, 0, Math.PI * 2);
+    ctx.fill();
+    // Tower
+    ctx.fillStyle = '#e8e2d0';
+    ctx.fillRect(baseX() - 9, baseY() - 30, 18, 34);
+    // Lamp room
+    ctx.fillStyle = '#c94a3a';
+    ctx.fillRect(baseX() - 11, baseY() - 38, 22, 9);
+    // Lamp glow
+    ctx.fillStyle = '#ffe9a8';
+    ctx.beginPath();
+    ctx.arc(lampX(), lampY(), 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawShip(s) {
+    const ang = Math.atan2(s.vy, s.vx);
+    if (s.lit) {
+      ctx.fillStyle = 'rgba(255, 230, 150, 0.25)';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 14, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(ang);
+    if (s.ghost) ctx.globalAlpha = s.lit ? 1 : GHOST_HIDDEN_ALPHA;
+    ctx.fillStyle = s.lit ? (s.ghost ? '#bfe6ff' : '#f3e2a6') : '#7d8ea3';
+    ctx.beginPath();
+    ctx.moveTo(11, 0);
+    ctx.lineTo(-8, -5);
+    ctx.lineTo(-8, 5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawCan(c) {
+    ctx.fillStyle = '#e0a526';
+    ctx.fillRect(c.x - 6, c.y - 7, 12, 14);
+    ctx.fillStyle = '#7a4f0c';
+    ctx.fillRect(c.x - 6, c.y - 7, 12, 3);
+  }
+
+  function drawRain() {
+    ctx.strokeStyle = 'rgba(170, 200, 230, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const d of rain) {
+      ctx.moveTo(d.x, d.y);
+      ctx.lineTo(d.x + d.len * 0.4, d.y - d.len);
+    }
+    ctx.stroke();
+  }
+
+  function drawHUD() {
+    const g = game;
+
+    // Oil bar and stats
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(18, 18, 320, 50);
+    ctx.fillStyle = '#c9b68a';
+    ctx.font = '14px Georgia, serif';
+    ctx.fillText('Oil', 28, 38);
+    ctx.fillStyle = '#2a2a2a';
+    ctx.fillRect(60, 27, 160, 12);
+    const frac = g.oil / OIL_MAX;
+    ctx.fillStyle = frac > 0.25 ? '#f2c14e' : '#d9534f';
+    ctx.fillRect(60, 27, 160 * frac, 12);
+    ctx.fillStyle = '#e8e2d0';
+    ctx.fillText('Saved: ' + g.saved + '   Wrecked: ' + g.wrecked + '/' + WRECK_LIMIT, 28, 60);
+
+    // Night timer
+    const left = g.dawn ? 0 : Math.max(0, g.nightDuration - g.nightTime);
+    ctx.textAlign = 'right';
+    ctx.fillText(
+      g.dawn ? 'Dawn' : 'Night ' + g.night + '  |  dawn in ' + Math.ceil(left) + 's',
+      W - 18, 38
+    );
+    ctx.textAlign = 'left';
+
+    // Banner message
+    if (bannerTime > 0) {
+      ctx.globalAlpha = Math.min(1, bannerTime);
+      ctx.fillStyle = '#f5e7b8';
+      ctx.font = '28px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(bannerText, W / 2, H * 0.16);
+      ctx.textAlign = 'left';
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawOverlay(title, lines) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#f5e7b8';
+    ctx.font = '56px Georgia, serif';
+    ctx.fillText(title, W / 2, H * 0.3);
+    ctx.font = '19px Georgia, serif';
+    ctx.fillStyle = '#d7d0bd';
+    let y = H * 0.3 + 50;
+    for (const line of lines) {
+      ctx.fillText(line, W / 2, y);
+      y += 30;
+    }
+    ctx.textAlign = 'left';
+  }
+
+  function draw() {
+    drawBackground();
+    drawBeam();
+    drawRocks();
+    drawLighthouse();
+    for (const c of cans) drawCan(c);
+    for (const s of ships) drawShip(s);
+    drawRain();
+
+    // Lightning flash
+    if (flash > 0) {
+      ctx.fillStyle = 'rgba(200, 220, 255, ' + (flash * 0.25) + ')';
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    if (mode === 'playing') drawHUD();
+
+    if (mode === 'title') {
+      drawOverlay('Lamplight', [
+        'Move the mouse to aim the lamp’s beam.',
+        'Guide ships into the harbor on the left by leading them with the light.',
+        'Hold the mouse button to widen and brighten the beam. It burns oil faster.',
+        'Sweep the beam over floating oil cans to refuel.',
+        'Three wrecks or an empty lamp ends the game.',
+        'Click to begin.'
+      ]);
+    } else if (mode === 'over') {
+      drawOverlay('The Light Goes Out', [
+        overReason,
+        'Ships saved: ' + game.saved,
+        'Nights survived: ' + game.completed,
+        'Click to try again.'
+      ]);
+    }
+  }
+
+  // ---------- Input ----------
+  canvas.addEventListener('mousemove', function (e) {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+  });
+
+  canvas.addEventListener('mousedown', function (e) {
+    mouseX = e.clientX;
+    mouseY = e.clientY;
+    mouseDown = true;
+    if (mode === 'title') newGame();
+    else if (mode === 'over' && time - overAt > 0.8) newGame();
+  });
+
+  window.addEventListener('mouseup', function () {
+    mouseDown = false;
+  });
+
+  canvas.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+  });
+
+  // ---------- Main loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+  makeRocks(1);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
